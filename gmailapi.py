@@ -8,10 +8,12 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import pandas as pd
+import json
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
+emails_data = []
 def main():
     """Retrieve both sent and received messages and clean their bodies."""
     creds = None
@@ -35,17 +37,28 @@ def main():
         recipient_email = "snowwind0215@gmail.com"  # Replace with desired recipient's email
         start_date = "2024/12/01"  # Change this to your desired start date
         end_date = "2024/12/07"     # Change this to your desired end date
-        
+
         # Query for both sent and received messages
         query_sent = f"from:{sender_email} after:{start_date} before:{end_date}"
         query_received = f"to:{recipient_email} after:{start_date} before:{end_date}"
-
-        print("\nSent Messages:")
+        
+        # Initialize the list to collect email data
+        print("Sent Messages:")
         retrieve_messages(service, query_sent)
-
-        print("\nReceived Messages:")
+        print("Received Messages:")
         retrieve_messages(service, query_received)
-
+        # Load existing data from CSV
+        df = pd.DataFrame(emails_data)
+        if os.path.isfile("emails_for_training.csv"):
+            # Load existing data from CSV
+            existing_df = pd.read_csv('emails_for_training.csv')
+            update_df=df[~df.apply(tuple, 1).isin(existing_df.apply(tuple,1))]
+            update_df.to_csv('emails_for_training.csv', index=False,mode="a", header=False)
+            print("update successfully!")
+        else:
+            df.to_csv('emails_for_training.csv', index=False, mode="a")
+            print("Create CSV Files")
+    
     except HttpError as error:
         print(f"An error occurred: {error}")
 
@@ -54,7 +67,7 @@ def retrieve_messages(service, query):
     try:
         results = service.users().messages().list(userId="me", q=query).execute()
         messages = results.get("messages", [])
-
+        
         if not messages:
             print("No messages found.")
             return
@@ -64,26 +77,31 @@ def retrieve_messages(service, query):
             for message in messages:
                 msg = service.users().messages().get(userId="me", id=message['id']).execute()
                 
+                # Extract metadata
+                headers = msg['payload']['headers']
+                metadata = extract_metadata(headers)
                 # Get the email body
-                body = ""
-                if 'payload' in msg and 'parts' in msg['payload']:
-                    for part in msg['payload']['parts']:
-                        if part['mimeType'] == 'text/plain':
-                            body = part['body'].get('data', '')
-                            break
-                elif 'payload' in msg and 'body' in msg['payload']:
-                    body = msg['payload']['body'].get('data', '')
+                body = get_email_body(msg)
 
-                if body:
-                    body = base64.urlsafe_b64decode(body).decode('utf-8')
-                else:
-                    body = "No content"
-                
                 # Clean the email content
                 cleaned_content = clean_email_content(body)
-                
-                print(f"Cleaned Content: {cleaned_content[:100]}...")  # Print first 100 characters of cleaned content
+                 # Append data to emails_data list         
+                emails_data.append({
+                    'From': metadata['From'],
+                    'To': metadata['To'],
+                    'Subject': metadata['Subject'],
+                    'Date': metadata['Date'],
+                    'Cleaned Body': cleaned_content,
+                })
             
+                # Create a DataFrame from the collected email data
+            
+                # Display metadata and cleaned content
+                # print(f"From: {metadata['From']}")
+                # print(f"To: {metadata['To']}")
+                # print(f"Subject: {metadata['Subject']}")
+                # print(f"Date: {metadata['Date']}")
+                # print(f"Cleaned Content: {cleaned_content[:100]}...")  # Print first 100 characters of cleaned content
             page_token = results.get('nextPageToken')
             if not page_token:
                 break
@@ -94,40 +112,42 @@ def retrieve_messages(service, query):
     except HttpError as error:
         print(f"An error occurred: {error}")
 
-def get_cleaned_body(msg):
-    """Extract and clean the body of the email message."""
-    # Decode the raw message
-    raw_data = msg.get('body')
-    if raw_data is None:
-        # Handle the case where 'raw' is not available
-        print("No raw data available for this message.")
-        return None  # or some default value
-    # Process raw_data as needed
+def get_email_body(msg):
+    """Extract the body of the email message."""
+    body = ""
+    if 'payload' in msg and 'parts' in msg['payload']:
+        for part in msg['payload']['parts']:
+            if part['mimeType'] == 'text/plain':
+                body = part['body'].get('data', '')
+                break
+    elif 'payload' in msg and 'body' in msg['payload']:
+        body = msg['payload']['body'].get('data', '')
+
+    if body:
+        body = base64.urlsafe_b64decode(body).decode('utf-8')
     else:
-    # raw_data = msg['raw']
-        msg_bytes = base64.urlsafe_b64decode(raw_data.encode('UTF-8'))
-        
-        # Parse the email message
-        mime_msg = BytesParser(policy=policy.default).parsebytes(msg_bytes)
+        body = "No content"
+    
+    return body
 
-        # Get the plain text part of the email body
-        if mime_msg.is_multipart():
-            for part in mime_msg.iter_parts():
-                if part.get_content_type() == 'text/plain':
-                    body = part.get_payload(decode=True).decode(part.get_content_charset())
-                    break
-        else:
-            body = mime_msg.get_payload(decode=True).decode(mime_msg.get_content_charset())
-
-        return clean_text(body)
+def extract_metadata(headers):
+    """Extract relevant metadata from email headers."""
+    metadata = {}
+    for header in headers:
+        name = header['name']
+        value = header['value']
+        if name in ['From', 'To', 'Subject', 'Date']:
+            metadata[name] = value
+    return metadata
 
 def clean_email_content(content):
+    """Clean the email content by removing signatures, disclaimers, and special characters."""
+    
     # Remove email signatures
     content = re.sub(r'--\s*\n.*', '', content, flags=re.DOTALL)
     
     # Remove common disclaimer patterns
     content = re.sub(r'CONFIDENTIALITY NOTICE:.*', '', content, flags=re.DOTALL | re.IGNORECASE)
-    content = re.sub(r'This email and any files transmitted with it are confidential.*', '', content, flags=re.DOTALL | re.IGNORECASE)
     
     # Remove special characters, keeping only alphanumeric characters, spaces, and basic punctuation
     content = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', content)
@@ -136,6 +156,7 @@ def clean_email_content(content):
     content = re.sub(r'\s+', ' ', content).strip()
     
     return content
+
 
 
 if __name__ == "__main__":
